@@ -20,6 +20,8 @@ Note: How to add special tokens to Qwen2.5:
 
 """
 
+import json
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -87,6 +89,21 @@ class QwenOFTDefaultConfig:
         }
     )
 
+    # === Frozen LAST-ViT probe (disabled by default) ===
+    last_probe: dict = field(
+        default_factory=lambda: {
+            "enabled": False,
+            "checkpoint": None,
+            "checkpoint_path": None,
+            "device": None,
+            "intervention": "none",
+            "ratio": 0.25,
+            "crop_scale": 0.5,
+            "crop_count": 2,
+            "log_jsonl": None,
+        }
+    )
+
 
 @FRAMEWORK_REGISTRY.register("QwenOFT")
 class Qwenvl_OFT(baseframework):
@@ -135,6 +152,10 @@ class Qwenvl_OFT(baseframework):
         # L1 loss
         self.l1_loss = nn.L1Loss()
 
+        self.last_probe = None
+        self._last_probe_last_output = None
+        self._maybe_init_last_probe()
+
     def forward(
         self,
         examples: List[dict] = None,
@@ -179,6 +200,10 @@ class Qwenvl_OFT(baseframework):
         instructions = [instruction + prompt_suffix for instruction in instructions]
 
         # Step 1: QWenVL input format
+        last_probe_outputs = self._compute_last_probe(batch_images)
+        self._last_probe_last_output = last_probe_outputs
+        batch_images = self._apply_last_probe_intervention(batch_images, last_probe_outputs)
+        self._log_last_probe_metrics(last_probe_outputs, phase="forward")
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
@@ -252,6 +277,10 @@ class Qwenvl_OFT(baseframework):
         instructions = [instruction + prompt_suffix for instruction in instructions]
 
         # Step 1: QWenVL input format
+        last_probe_outputs = self._compute_last_probe(batch_images)
+        self._last_probe_last_output = last_probe_outputs
+        batch_images = self._apply_last_probe_intervention(batch_images, last_probe_outputs)
+        self._log_last_probe_metrics(last_probe_outputs, phase="predict_action")
         qwen_inputs = self.qwen_vl_interface.build_qwenvl_inputs(images=batch_images, instructions=instructions)
         with torch.autocast("cuda", dtype=torch.bfloat16):
             qwenvl_outputs = self.qwen_vl_interface(
@@ -274,6 +303,105 @@ class Qwenvl_OFT(baseframework):
 
         normalized_actions = pred_actions.detach().cpu().numpy()
         return {"normalized_actions": normalized_actions}
+
+    def _last_probe_cfg(self) -> dict:
+        cfg = getattr(self.config.framework, "last_probe", None)
+        if cfg is None:
+            return {}
+        if hasattr(cfg, "items"):
+            return dict(cfg.items())
+        return dict(cfg)
+
+    def _last_probe_enabled(self) -> bool:
+        return bool(self._last_probe_cfg().get("enabled", False))
+
+    def _maybe_init_last_probe(self) -> None:
+        if not self._last_probe_enabled() or self.last_probe is not None:
+            return
+
+        cfg = self._last_probe_cfg()
+        checkpoint_path = cfg.get("checkpoint_path", None) or cfg.get("checkpoint", None)
+        if not checkpoint_path:
+            raise ValueError("framework.last_probe.enabled=True requires checkpoint_path or checkpoint")
+
+        from starVLA.model.modules.last_vit_probe import LastViTProbe
+
+        self.last_probe = LastViTProbe(
+            checkpoint_path=checkpoint_path,
+            device=cfg.get("device", None),
+        )
+        logger.info(
+            "Initialized frozen LAST-ViT probe from %s; missing_keys=%d unexpected_keys=%d",
+            checkpoint_path,
+            len(self.last_probe.missing_keys),
+            len(self.last_probe.unexpected_keys),
+        )
+
+    def _compute_last_probe(self, batch_images):
+        if not self._last_probe_enabled():
+            return None
+        self._maybe_init_last_probe()
+        return self.last_probe(batch_images)
+
+    def _apply_last_probe_intervention(self, batch_images, last_probe_outputs):
+        if last_probe_outputs is None:
+            return batch_images
+
+        cfg = self._last_probe_cfg()
+        mode = str(cfg.get("intervention", "none") or "none").lower()
+        if mode in ("none", "off", "disabled"):
+            return batch_images
+
+        from starVLA.model.modules.last_vit_probe import (
+            crop_top_last_region,
+            mask_low_last_regions,
+            mask_random_regions,
+            mask_top_last_regions,
+            multicrop_top_last_regions,
+        )
+
+        count_maps = last_probe_outputs["count_map_raw"]
+        if mode in ("mask_top", "mask_top_last", "mask_top_last_regions"):
+            return mask_top_last_regions(batch_images, count_maps, ratio=cfg.get("ratio", 0.25))
+        if mode in ("mask_low", "mask_low_last", "mask_low_last_regions"):
+            return mask_low_last_regions(batch_images, count_maps, ratio=cfg.get("ratio", 0.25))
+        if mode in ("mask_random", "random"):
+            return mask_random_regions(batch_images, count_maps, ratio=cfg.get("ratio", 0.25))
+        if mode in ("crop_top", "crop_top_last", "crop_top_last_region"):
+            return crop_top_last_region(batch_images, count_maps, crop_scale=cfg.get("crop_scale", 0.5))
+        if mode in ("multicrop_top", "multicrop_top_last", "multicrop_top_last_regions"):
+            return multicrop_top_last_regions(
+                batch_images,
+                count_maps,
+                crop_scale=cfg.get("crop_scale", 0.5),
+                crop_count=cfg.get("crop_count", 2),
+            )
+        raise ValueError(f"Unknown LAST probe intervention mode: {mode}")
+
+    def _log_last_probe_metrics(self, last_probe_outputs, phase: str) -> None:
+        if last_probe_outputs is None:
+            return
+
+        cfg = self._last_probe_cfg()
+        log_jsonl = cfg.get("log_jsonl", None)
+        if not log_jsonl:
+            return
+
+        os.makedirs(os.path.dirname(os.path.abspath(log_jsonl)), exist_ok=True)
+        entropy = last_probe_outputs["entropy"].tolist()
+        top5_mass = last_probe_outputs["top5_mass"].tolist()
+        top10_mass = last_probe_outputs["top10_mass"].tolist()
+        with open(log_jsonl, "a", encoding="utf-8") as f:
+            for idx, (ent, top5, top10) in enumerate(zip(entropy, top5_mass, top10_mass)):
+                record = {
+                    "phase": phase,
+                    "image_index": idx,
+                    "intervention": self._last_probe_cfg().get("intervention", "none"),
+                    "entropy": float(ent),
+                    "top5_mass": float(top5),
+                    "top10_mass": float(top10),
+                }
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     def _gather_action_token_embeddings(
         self,
