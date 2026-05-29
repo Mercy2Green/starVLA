@@ -24,11 +24,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--last_checkpoint", required=True)
     parser.add_argument("--checkpoint", default=None)
+    parser.add_argument("--base_vlm", default=None)
+    parser.add_argument("--attn_implementation", default=None)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--max_samples", type=int, default=100)
     parser.add_argument("--modes", default="none,mask_top,mask_low,mask_random,crop_top")
     parser.add_argument("--framework_name", default="QwenOFT")
     parser.add_argument("--dry_run_fake_policy", action="store_true")
+    parser.add_argument("--allow_untrained_action_head", action="store_true")
     parser.add_argument("--save_first_n_visualizations", type=int, default=10)
     return parser.parse_args()
 
@@ -81,6 +84,20 @@ def ensure_last_probe_cfg(cfg, args: argparse.Namespace, mode: str) -> None:
     cfg.framework.last_probe.log_jsonl = str(Path(args.output_dir).expanduser().resolve() / "last_probe_metrics.jsonl")
 
 
+def apply_qwenvl_overrides(cfg, args: argparse.Namespace) -> None:
+    if args.base_vlm is None and args.attn_implementation is None:
+        return
+    if not hasattr(cfg, "framework"):
+        cfg.framework = {}
+    if not hasattr(cfg.framework, "qwenvl") or cfg.framework.qwenvl is None:
+        cfg.framework.qwenvl = {}
+    if args.base_vlm is not None:
+        base_vlm = Path(args.base_vlm).expanduser()
+        cfg.framework.qwenvl.base_vlm = str(base_vlm.resolve()) if base_vlm.exists() else args.base_vlm
+    if args.attn_implementation is not None:
+        cfg.framework.qwenvl.attn_implementation = args.attn_implementation
+
+
 def set_mode_on_model(model, cfg, args: argparse.Namespace, mode: str) -> None:
     ensure_last_probe_cfg(cfg, args, mode)
     if hasattr(model, "config"):
@@ -127,7 +144,13 @@ def load_checkpoint_conservative(model, checkpoint_path: str):
 
 def build_model(cfg, args: argparse.Namespace):
     cfg.framework.name = args.framework_name
+    apply_qwenvl_overrides(cfg, args)
     ensure_last_probe_cfg(cfg, args, mode="none")
+    if not args.checkpoint:
+        print(
+            "WARNING: no StarVLA/QwenOFT action checkpoint provided. Action head may be untrained; "
+            "this run is implementation smoke only, not scientific evidence."
+        )
     if args.framework_name == "QwenOFT":
         from starVLA.model.framework.VLM4A.QwenOFT import Qwenvl_OFT
 
@@ -138,6 +161,7 @@ def build_model(cfg, args: argparse.Namespace):
         model = build_framework(cfg)
     if args.checkpoint:
         load_checkpoint_conservative(model, args.checkpoint)
+    print_action_token_diagnostics(model)
     target_device = torch.device(args.device)
     if target_device.type == "cuda" and not torch.cuda.is_available():
         print(f"WARNING: requested device {args.device}, but CUDA is unavailable; keeping model on CPU.")
@@ -145,6 +169,22 @@ def build_model(cfg, args: argparse.Namespace):
         model.to(target_device)
     model.eval()
     return model
+
+
+def print_action_token_diagnostics(model) -> None:
+    if not all(hasattr(model, attr) for attr in ("action_token", "action_token_id", "chunk_len", "qwen_vl_interface")):
+        return
+    tokenizer = model.qwen_vl_interface.processor.tokenizer
+    tokenized = tokenizer(model.action_token, add_special_tokens=False)["input_ids"]
+    repeated = tokenizer(model.action_token * model.chunk_len, add_special_tokens=False)["input_ids"]
+    count = sum(1 for token_id in repeated if token_id == model.action_token_id)
+    print(f"action token: {model.action_token}")
+    print(f"action token id: {model.action_token_id}")
+    print(f'tokenizer("{model.action_token}", add_special_tokens=False): {tokenized}')
+    print(f"chunk_len: {model.chunk_len}")
+    print(f"action token id count in repeated token string: {count} / {model.chunk_len}")
+    if count < model.chunk_len:
+        print("WARNING: action token may not be tokenized as expected; QwenOFT may fail to gather action token embeddings.")
 
 
 def fake_policy_actions(images: List[Image.Image], lang: str, mode: str) -> np.ndarray:

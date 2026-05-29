@@ -222,6 +222,7 @@ class Qwenvl_OFT(baseframework):
             action_queries = self._gather_action_token_embeddings(
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
+            action_queries = action_queries.to(dtype=next(self.action_model.parameters()).dtype)
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
 
             # Label alignment: take the last chunk_len segment
@@ -299,6 +300,7 @@ class Qwenvl_OFT(baseframework):
             action_queries = self._gather_action_token_embeddings(
                 last_hidden, input_ids, action_token_id=self.action_token_id
             )  # [B, chunk_len, H]
+            action_queries = action_queries.to(dtype=next(self.action_model.parameters()).dtype)
             pred_actions = self.action_model.predict_action(action_queries)  # (B, chunk_len, action_dim)
 
         normalized_actions = pred_actions.detach().cpu().numpy()
